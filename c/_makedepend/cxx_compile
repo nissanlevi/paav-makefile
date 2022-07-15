@@ -1,0 +1,1 @@
+/usr/bin/g++ -Iinclude -Wall -fPIC -c -O2 -Wp,-MD,c/_makedepend/.d

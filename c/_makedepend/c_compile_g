@@ -1,0 +1,1 @@
+/usr/bin/gcc -Iinclude -Wall -fPIC -c -g -Wp,-MD,c/_makedepend/.d

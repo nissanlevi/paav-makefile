@@ -1,0 +1,1788 @@
+# Generic MSIL CAD makefile written for GNU's make
+#
+# Advantages over previous system:
+#
+# 1. All-in-one makefile; no more makefiles for each subdirectory
+# 2. Simplicity of use in common situations (building apps, libs, shlibs, tests)
+# 3. Produces project version dependency list and version stamp file
+# 4. Bulk of content in separate include file (this one!)
+# 5. Version numbers of libraries used must appear explicitly, not
+#    through environment variables
+
+
+# Makefile table of contents
+# ==========================
+#
+# I.   Build compiler flags for include and library directories
+#      A. Use textual manipulation to determine project names/versions
+#      B. Generate names of main targets: apps, tests, libs, shlibs
+#      C. Use above results to build compiler flag lists
+#      D. Variable used only by release_links and check_versions targets
+
+# II.  Major targets of makefile
+#      user_build release_build
+#      all debug opt apps_g apps tests_g tests libs_g libs shlibs_g shlibs
+#
+# III. Minor targets of makefile
+#      A. clean and its relatives: clean cleandeps cleanobjs cleanallobjs
+#               cleanverstamps cleanall no_deps
+#      B. verstamps: Regenerate version stamp files
+#      C. release, release_linux, non_cvs_release, non_cvs_root, 
+#		nobuild_release, other_makefiles: List release files
+#      D. cad_projects, cad_links, release_links, check_versions:
+#               Check link library versions
+#      E: show_libraries, show_shared_libraries, 
+#		show_applications, show_tests: List main targets
+#      F. install, postcheckout, 
+#		cad_dist, release_cad: Install files in system directories
+#      G. strip: Create stripped binaries from executables
+#      H. tags, libtags: Generate etags/ctags files in C / lib directories
+#      I. can_compile, can_install, can_strip: Query build properties (0/1)
+#      J. makedebug: Print variable value to debug the makefile
+#
+# IV.  Compilation dependencies
+#      A. C/C++ compiler flags for compilation
+#
+#      B. Pattern rules for compiling source files
+#         B1. Macros to generate make dependency file from C/C++ source file
+#         B2. Pattern rules for compiling C/C++
+#         B3. Pattern rules to compile lex/yacc combinations -
+#             a lex and a yacc file
+#         B4. Pattern rules to create application/library version stamp files
+#
+#      C. Automatic generation of executable dependency files
+#         C1. Basic macros
+#         C2. Make commands to generate the included dependency makefiles
+#         C3. Include the include files
+
+
+
+#################################################################
+#								#
+#			   SECTION I 				#
+#								#
+#    Build compiler flags for include and library directories   #
+#								#
+#################################################################
+
+DEBUG_EXT := _g
+OPT_EXT   :=
+
+# Set ECHO to empty string to turn on debugging output of all makefile commands
+ECHO := @
+
+
+DEPEND_DIR := $(DEPEND_DIR)$(ARCH_SUFFIX)
+PLATFORM_CODE := $(ARCH_SUFFIX)
+
+# If 64-bit compilation, change the target directories
+ifneq ($(strip $(USE_FULL_64BIT)),)
+
+ifeq ($(ARCH_SUFFIX),S)
+GCC_FLAGS  := $(GCC_FLAGS) -m64
+endif # ARCH_SUFFIX == S
+
+BIN           := $(BIN)_64
+STRIP_BIN     := strip_$(BIN)
+OBJ           := $(OBJ)_64
+LIBDIR        := $(LIBDIR)_64
+DEPEND_DIR    := $(DEPEND_DIR)_64
+PLATFORM_CODE := $(PLATFORM_CODE)_64
+
+endif # USE_FULL_64BIT
+
+
+
+##########
+# Part A: Use textual manipulation to determine project names/versions
+##########
+
+# Name of current project; for /usr/cad/projects/foo/foo-2.3, it's "foo"
+
+ifeq ($(strip $(PROJECT_NAME)),)  # Let user define PROJECT_NAME
+PROJECT_NAME := $(shell perl -e \
+	'"$(CURDIR)" =~ m{/([^/]*)-([^-/]*)$$}; print $$1; ')
+endif
+
+# Version of current project; for /usr/cad/projects/foo/foo-2.3, it's "2.3"
+PROJECT_VER := $(shell perl -e \
+	'"$(CURDIR)" =~ m{/([^/]*)-([^-/]*)$$}; print $$2; ')
+
+# Given subdirectory in $(arg), ALL_CVSFILES retrieves the names of
+# all files in the CVS repository under that subdirectory, recursively.
+comma := ,
+ALL_CVSFILES = $(subst $(CVSROOT)/$(PROJECT_NAME)/$(arg)/,, \
+	$(subst $(comma)v,, \
+	$(shell find $(CVSROOT)/$(PROJECT_NAME)/$(arg) -name '*,v' -print | grep -v /Attic/)))
+
+
+# With "cool-2.4" in $(arg), split into CAD_PROJECT_VERSION, CAD_PROJECT_NAME
+
+# Replace cool-2.4 with cool.2:4
+CAD_PROJECT_TEMP = $(subst -,.,$(subst .,:,$(arg)))
+
+# Strip off version number: 2.4
+CAD_PROJECT_VERSION = $(subst :,.,$(subst .,,$(suffix $(CAD_PROJECT_TEMP))))
+
+# Strip off library name: cool
+CAD_PROJECT_NAME = $(basename $(CAD_PROJECT_TEMP))
+
+# Use perl to follow softlink and generate correct subdirectory name:
+# To read this as normal perl, replace $$ with $
+#
+# Comments for the perl script (because of make, they can't be in the script):
+#
+# 1. Find the subdirectory name corresponding to the CAD_PROJECTS code:
+#    2.3 => proj-2.3, .release => .release, v2.3 => .proj-2.3
+#    a. If version number starts with 'v' (v2.3) it's a bugfix softlink
+#    b. If version number has dot and text (.release) it's a plain softlink
+#
+# 2. Find the corresponding director
+#    a. If directory doesn't exist return .NONE
+#    b. If it's a softlink, get actual name
+#
+CAD_PROJECT_LINK = $(shell perl -e \
+	'my $$arg = "$(arg)"; \
+	my ($$project, $$version) = split(/-/, $$arg); \
+	my $$subdir; \
+	if ($$version =~ m{^(v[0-9].*)$$}) { \
+		$$arg =~ s/-v/-/; \
+		$$subdir = ".$$arg"; \
+	} \
+	elsif ($$version =~ m{^(\..*)$$}) { \
+		$$subdir = $$1; \
+	} else { $$subdir = "$$arg" } \
+\
+	my $$fulldir = "$(CAD_DIR)/$$project/$$subdir"; \
+	$$fulldir = "$(CAD_DIR)/$$project/$$version" if (! -d $$fulldir); \
+	if ( -d $$fulldir) {  \
+		if ( -l $$fulldir) {  \
+			my $$listing = `ls -l $$fulldir`; \
+			$$listing =~ m{([^ /]+[ /]*$$)}; \
+			print $$1; \
+		} \
+		else { print $$subdir; } \
+	} \
+	else { print ".NONE"; } \
+')
+
+LOCAL_PROJECT_ROOT = $($(CAD_PROJECT_NAME)_ROOT)
+
+LOCAL_PROJECT_LINK = $(foreach CAD_DIR,$(LOCAL_PROJECT_ROOT),$(CAD_PROJECT_LINK))
+
+# Given project name-version $(arg), the project version base directory
+CAD_PROJECT_DIR = $(CAD_DIR)/$(CAD_PROJECT_NAME)/$(CAD_PROJECT_LINK)
+LOCAL_PROJECT_DIR = $(LOCAL_PROJECT_ROOT)/$(CAD_PROJECT_NAME)/$(LOCAL_PROJECT_LINK)
+
+# Macro for use by CAD_SUBPROJECT_PROJECTS, which in turn can be included
+# in user-defined CAD_PROJECTS variable.
+
+# Return list of projects used by a CAD project, as they appear in the
+# project's makefile in /usr/cad
+CAD_PROJECT_PROJECT = $(shell $(MAKE) -s -C $(CAD_PROJECT_DIR) cad_projects)
+
+# Return list of all projects used by CAD projects listed in CAD_SUBPROJECTS
+CAD_SUBPROJECT_PROJECTS :=  $(foreach arg,$(CAD_SUBPROJECTS), \
+	$(arg) $(CAD_PROJECT_PROJECT))
+
+CAD_PROJECT_LINKS := $(foreach arg,$(CAD_PROJECTS),$(CAD_PROJECT_LINK))
+LOCAL_PROJECT_LINKS := $(foreach arg,$(LOCAL_PROJECTS),$(LOCAL_PROJECT_LINK))
+
+LOCAL_PROJECT_NAMES := $(foreach arg,$(LOCAL_PROJECTS),$(CAD_PROJECT_NAME))
+LOCAL_PROJECT_NAME_PATTERNS := $(addsuffix -%,$(LOCAL_PROJECT_NAMES))
+
+CAD_PROJECTS_NONLOCAL := $(filter-out $(LOCAL_PROJECT_NAME_PATTERNS),$(CAD_PROJECTS))
+
+ifeq ($(strip $(TEST_PROJECTS)),)
+TEST_PROJECTS := $(CAD_PROJECTS_NONLOCAL)
+endif
+
+# Given a project name alone $(arg), extract name-version from CAD_PROJECTS
+CAD_PROJECT_SPECIFIER_BY_NAME = $(filter $(arg)-%,$(CAD_PROJECTS))
+LOCAL_PROJECT_SPECIFIER_BY_NAME = $(filter $(arg)-%,$(LOCAL_PROJECTS))
+
+# Given a project name alone $(arg), the project version base directory
+CAD_VERSION = $(foreach arg,$(CAD_PROJECT_SPECIFIER_BY_NAME), \
+	$(CAD_PROJECT_DIR))
+
+LOCAL_VERSION = $(foreach arg,$(LOCAL_PROJECT_SPECIFIER_BY_NAME), \
+	$(LOCAL_PROJECT_DIR))
+
+
+##########
+# Part B: Generate names of main targets: apps, tests, libs, shlibs
+##########
+
+# Even if user has requested executable extensions to be swapped, 
+# turn off swapping if 'gmake release_build' is run
+ifneq ($(strip $(SWAP_EXTS)),)
+ifneq ($(filter release_build,$(MAKECMDGOALS)),)
+SWAP_EXTS :=
+endif
+endif
+
+# All application filenames (debugging and optimized)
+# When not doing a release, switch the final target filenames so the debug
+# version has the regular (optimized) name.
+ifneq ($(strip $(APPLICATIONS)),)
+ifneq ($(strip $(SWAP_EXTS)),)
+APPLICATIONS_TARGETS_g := $(foreach arg,$(APPLICATIONS),$(BIN)/$(arg)$(OPT_EXT))
+APPLICATIONS_TARGETS := $(foreach arg,$(APPLICATIONS),$(BIN)/$(arg)$(DEBUG_EXT))
+else
+APPLICATIONS_TARGETS_g := $(foreach arg,$(APPLICATIONS),$(BIN)/$(arg)$(DEBUG_EXT))
+APPLICATIONS_TARGETS := $(foreach arg,$(APPLICATIONS),$(BIN)/$(arg)$(OPT_EXT))
+endif
+endif
+
+# All test program filenames (debugging and optimized)
+# When not doing a release, switch the final target filenames so the debug
+# version has the regular (optimized) name.
+ifneq ($(strip $(TESTS)),)
+ifneq ($(strip $(SWAP_EXTS)),)
+TESTS_TARGETS_g := $(foreach arg,$(TESTS),$(BIN)/$(arg)$(OPT_EXT))
+TESTS_TARGETS := $(foreach arg,$(TESTS),$(BIN)/$(arg)$(DEBUG_EXT))
+else
+TESTS_TARGETS_g := $(foreach arg,$(TESTS),$(BIN)/$(arg)$(DEBUG_EXT))
+TESTS_TARGETS := $(foreach arg,$(TESTS),$(BIN)/$(arg)$(OPT_EXT))
+endif
+endif
+
+# Add the directory and suffix to a library file
+ifneq ($(strip $(LIBRARIES)),)
+LIB_FILE_g = $(LIBDIR)/lib$(patsubst lib%,%,$(arg))$(LIB_EXT_g)
+LIB_FILE = $(LIBDIR)/lib$(patsubst lib%,%,$(arg))$(LIB_EXT)
+
+# All library filenames (debugging and optimized)
+LIBRARIES_TARGETS_g := $(foreach arg,$(LIBRARIES),$(LIB_FILE_g))
+LIBRARIES_TARGETS := $(foreach arg,$(LIBRARIES),$(LIB_FILE))
+endif
+
+# Add the directory and suffix to a shared library file
+ifneq ($(strip $(SHARED_LIBRARIES)),)
+SHLIB_FILE_g = $(LIBDIR)/lib$(patsubst lib%,%,$(arg))$(SHLIB_EXT_g)
+SHLIB_FILE = $(LIBDIR)/lib$(patsubst lib%,%,$(arg))$(SHLIB_EXT)
+
+# All shared library filenames (debugging and optimized)
+SHLIBRARIES_TARGETS_g := $(foreach arg,$(SHARED_LIBRARIES),$(SHLIB_FILE_g))
+SHLIBRARIES_TARGETS := $(foreach arg,$(SHARED_LIBRARIES),$(SHLIB_FILE))
+endif
+
+
+##########
+# Part C: Use above results to build compiler flag lists
+##########
+
+# Create list of project version base directories
+CAD_PROJECT_DIRS := $(foreach arg,$(CAD_PROJECTS_NONLOCAL),$(CAD_PROJECT_DIR))
+TEST_PROJECT_DIRS := $(foreach arg,$(TEST_PROJECTS),$(CAD_PROJECT_DIR))
+LOCAL_PROJECT_DIRS := $(foreach arg,$(LOCAL_PROJECTS),$(LOCAL_PROJECT_DIR))
+
+# Create -I flag for each library include directory
+# Two versions of include flags: 
+#  - CAD_INCLUDE_FLAGS for CAD_PROJECTS,
+#  - TEST_INCLUDE_FLAGS for TEST_PROJECTS,
+
+CAD_INCLUDE_FLAGS := -I$(INCLUDE_DIR) $(addprefix -I,$(INCLUDE_DIRS)) \
+	$(foreach arg,$(LOCAL_PROJECT_DIRS) $(CAD_PROJECT_DIRS), \
+		-I$(arg)/$(INCLUDE_DIR))
+
+TEST_INCLUDE_FLAGS := -I$(INCLUDE_DIR) $(addprefix -I,$(INCLUDE_DIRS)) \
+	$(foreach arg,$(LOCAL_PROJECT_DIRS) $(TEST_PROJECT_DIRS), \
+		-I$(arg)/$(INCLUDE_DIR))
+
+# When building a library or application, compile file with CAD_INCLUDE_FLAGS
+# When building a test, compile file with TEST_INCLUDE_FLAGS
+$(APPLICATIONS_TARGETS_g) $(APPLICATIONS_TARGETS): INCLUDE_FLAGS := $(CAD_INCLUDE_FLAGS)
+$(LIBRARIES_TARGETS_g) $(LIBRARIES_TARGETS): INCLUDE_FLAGS := $(CAD_INCLUDE_FLAGS)
+$(SHLIBRARIES_TARGETS_g) $(SHLIBRARIES_TARGETS): INCLUDE_FLAGS := $(CAD_INCLUDE_FLAGS)
+$(TESTS_TARGETS_g) $(TESTS_TARGETS): INCLUDE_FLAGS := $(TEST_INCLUDE_FLAGS)
+
+# In other circumstances, compile file with TEST_INCLUDE_FLAGS (to make sure
+# everything's been included)
+INCLUDE_FLAGS := $(TEST_INCLUDE_FLAGS)
+
+
+# All additional compilation flags 
+ALL_FLAGS := $(addprefix -D,$(DEFINES)) $(INCLUDE_FLAGS)
+
+
+# The user can specify the library subdirectory name for a specific project
+# using ???_LIBDIR - default is $(LIB)
+#
+PROJECT_LIBDIR = $(firstword $($(CAD_PROJECT_NAME)_LIBDIR) $(LIBDIR))
+
+# Create -L flag for each library link directory
+CAD_LIBRARY_DIRS := \
+	$(foreach arg,$(LOCAL_PROJECTS), \
+		$(LOCAL_PROJECT_DIR)/$(PROJECT_LIBDIR)) \
+	$(foreach arg,$(CAD_PROJECTS_NONLOCAL), \
+		$(CAD_PROJECT_DIR)/$(PROJECT_LIBDIR)) \
+	$(LIBRARY_DIRS)
+
+TEST_LIBRARY_DIRS := \
+	$(foreach arg,$(LOCAL_PROJECTS), \
+		$(LOCAL_PROJECT_DIR)/$(PROJECT_LIBDIR)) \
+	$(foreach arg,$(TEST_PROJECTS), \
+		$(CAD_PROJECT_DIR)/$(PROJECT_LIBDIR)) \
+	$(LIBRARY_DIRS)
+
+
+# When building a library or application, link with CAD_LIBRARY_DIRS
+# When building a test, link with TEST_LIBRARY_DIRS
+$(APPLICATIONS_TARGETS_g) $(APPLICATIONS_TARGETS): ALL_LIBRARY_DIRS := $(CAD_LIBRARY_DIRS)
+$(TESTS_TARGETS_g) $(TESTS_TARGETS): ALL_LIBRARY_DIRS := $(TEST_LIBRARY_DIRS)
+$(APPS_DEPEND): ALL_LIBRARY_DIRS := $(CAD_LIBRARY_DIRS)
+$(TESTS_DEPEND): ALL_LIBRARY_DIRS := $(TEST_LIBRARY_DIRS)
+
+# In other circumstances, link with TEST_LIBRARY_DIRS (to make sure
+# everything's been included)
+ALL_LIBRARY_DIRS := $(TEST_LIBRARY_DIRS)
+
+
+LDFLAGS := $(addprefix -L,$(ALL_LIBRARY_DIRS)) $(EXTRA_LDFLAGS)
+
+# Add debug flag to library names
+CAD_LIBS_g := $(addsuffix $(DEBUG_EXT),$(CAD_LIBS))
+
+# Complete link library lists (debugging and optimized)
+LIBS_g  := $(CAD_LIBS_g) $(MISCLIBS) $(SYSLIBS)
+LIBS    := $(CAD_LIBS)   $(MISCLIBS) $(SYSLIBS)
+
+# If above library order is not satisfactory, user can specify
+# list of library names in LIBORDER.
+# This will specify only the order of the libraries; each library
+# must still appear in CAD_LIBS, MISCLIBS or SYSLIBS
+ifneq ($(strip $(LIBORDER)),)
+LIBS   := $(LIBORDER)
+LIBS_g := $(foreach lib,$(LIBORDER), \
+		$(addsuffix $(DEBUG_EXT),$(filter $(lib),$(CAD_LIBS))) \
+		$(filter $(lib),$(MISCLIBS) $(SYSLIBS)))
+endif
+
+# Link library flags (regular and optimized)
+ALL_EXTRA_LIBFLAGS := $(EXTRA_LIBFLAGS)
+CLIBS_g  := $(LIBS_g:%=-l%) $(ALL_EXTRA_LIBFLAGS)
+CLIBS    := $(LIBS:%=-l%)   $(ALL_EXTRA_LIBFLAGS)
+
+
+# Given a library name (without the "lib" or ".a"), return the full pathname
+# of the file used.
+# First searches libraries built by current project (LIBRARIES_TARGETS),
+# then all library directories
+LIBRARY_FILENAME = $(firstword \
+	$(filter %/lib$(libname)$(SHLIB_EXT),$(SHLIBRARIES_TARGETS) $(SHLIBRARIES_TARGETS_g)) \
+	$(filter %/lib$(libname)$(LIB_EXT),$(LIBRARIES_TARGETS) $(LIBRARIES_TARGETS_g)) \
+	$(foreach libdir,$(ALL_LIBRARY_DIRS), \
+		$(wildcard $(libdir)/lib$(libname)$(SHLIB_EXT)) \
+		$(wildcard $(libdir)/lib$(libname)$(LIB_EXT))))
+
+# Return full pathnames for all link libraries in use
+LIBRARY_FILENAMES_g := $(foreach libname,$(LIBS_g),$(LIBRARY_FILENAME))
+LIBRARY_FILENAMES   := $(foreach libname,$(LIBS),$(LIBRARY_FILENAME))
+
+
+##########
+# Part D: Variable used only by release_links and check_versions targets
+##########
+
+# Only include this section if necessary for 'gmake release_links' or
+# 'gmake check_versions'
+ifneq ($(filter release_links check_versions,$(MAKECMDGOALS)),)
+
+# Like CAD_PROJECT_LINK, but only converts 'v' bugfix softlinks.
+# Used on project release to ensure that .release or .develop softlinks
+# not used.
+CAD_RELEASE_LINK = $(shell perl -e \
+	'my $$arg = "$(arg)"; \
+	my ($$project, $$version) = split(/-/, $$arg); \
+	my $$subdir; \
+	my $$bugfixlink = 0; \
+	if ($$version =~ m{^(v[0-9].*)$$}) { \
+		$$arg =~ s/-v/-/; \
+		$$subdir = ".$$arg"; \
+		$$bugfixlink = 1; \
+	} \
+	elsif ($$version =~ m{^(\..*)$$}) { \
+		$$subdir = $$1; \
+	} else { $$subdir = "$$arg" } \
+\
+	my $$fulldir = "$(CAD_DIR)/$$project/$$subdir"; \
+	if ( -d $$fulldir) {  \
+		if (-l $$fulldir) {  \
+			if ($$bugfixlink) { \
+				my $$listing = `ls -l $$fulldir`; \
+				$$listing =~ m{([^ /]+[ /]*$$)}; \
+				print $$1; \
+			} \
+			else { print "$$project-$$subdir"; } \
+		} \
+		else { print $$subdir; } \
+	} \
+	else { print ".NONE"; } \
+')
+
+CAD_RELEASE_LINKS := $(foreach arg,$(CAD_PROJECTS),$(CAD_RELEASE_LINK))
+endif  # release_links check_versions
+
+
+#################################################################
+#								#
+#			   SECTION II				#
+#								#
+#		   Major targets of makefile			#
+#								#
+#################################################################
+
+# Phony targets are symbolic names, not files to be built
+.PHONY: all debug opt apps_g apps libs_g libs shlibs_g shlibs tests_g tests
+.PHONY: opt_64 debug_64 clean_64
+.PHONY: appsdepends testsdepends libsdepends shlibsdepends
+.PHONY: user_build release_build
+
+# The default target to be run by user / developer
+ifndef DEFAULT_TARGETS
+DEFAULT_TARGETS := debug
+endif
+user_build: $(DEFAULT_TARGETS)
+
+
+# The target to be run by the release scripts
+#
+# Note: When release_build is invoked, any applications/tests are built
+# so that the unmarked name is the optimized version and the marked name
+# is the debugging version (standard convention).
+# Otherwise, the build is assumed to be a user build, and the convention
+# is reversed for applications and tests (not for libraries!)
+ifndef RELEASE_TARGETS
+RELEASE_TARGETS := libs libs_g shlibs shlibs_g apps
+endif
+release_build: $(RELEASE_TARGETS)
+
+
+# All applications, libraries and test programs, debugging and optimized
+all:    debug opt $(all_OTHER_TARGETS)
+	@echo
+	@echo "Done building all applications, libraries and test programs."
+	@echo
+
+# All debugging-enabled applications, libraries and test programs
+# Libs are built before apps/tests in case executables use libs
+debug:  libs_g shlibs_g apps_g tests_g $(debug_OTHER_TARGETS)
+	@echo
+	@echo "Done building debugging-enabled applications, libraries and test programs."
+	@echo
+
+# All optimized applications, libraries and test programs
+# Libs are built before apps/tests in case executables use libs
+opt:    libs shlibs apps tests $(opt_OTHER_TARGETS)
+	@echo
+	@echo "Done building optimized applications, libraries and test programs."
+	@echo
+
+ifneq ($(strip $(APPLICATIONS) $(apps_g_OTHER_TARGETS) $(apps_OTHER_TARGETS)),)
+# All debugging-enabled applications
+apps_g: $(APPLICATIONS_TARGETS_g) $(apps_g_OTHER_TARGETS)
+	@echo
+	@echo "Done building debugging-enabled applications ($(APPLICATIONS) $(apps_g_OTHER_TARGETS))"
+	@echo
+
+# All optimized applications
+apps:   $(APPLICATIONS_TARGETS) $(apps_OTHER_TARGETS)
+	@echo
+	@echo "Done building optimized applications ($(APPLICATIONS) $(apps_OTHER_TARGETS))"
+	@echo
+else
+apps_g:
+	@echo
+	@echo "No applications to build"
+	@echo
+apps:
+	@echo
+	@echo "No applications to build"
+	@echo
+endif
+
+ifneq ($(strip $(TESTS) $(tests_g_OTHER_TARGETS) $(tests_OTHER_TARGETS)),)
+# All debugging-enabled test programs
+tests_g: $(TESTS_TARGETS_g) $(tests_g_OTHER_TARGETS)
+	@echo
+	@echo "Done building debugging-enabled test programs ($(TESTS) $(tests_g_OTHER_TARGETS))"
+	@echo
+
+# All optimized test programs
+tests:  $(TESTS_TARGETS) $(tests_OTHER_TARGETS)
+	@echo
+	@echo "Done building optimized test programs ($(TESTS) $(tests_OTHER_TARGETS))"
+	@echo
+else
+tests_g:
+	@echo
+	@echo "No tests to build"
+	@echo
+tests:
+	@echo
+	@echo "No tests to build"
+	@echo
+endif
+
+ifneq ($(strip $(LIBRARIES) $(libs_g_OTHER_TARGETS) $(libs_OTHER_TARGETS)),)
+# All debugging-enabled libraries
+libs_g: $(LIBRARIES_TARGETS_g) $(libs_g_OTHER_TARGETS)
+	@echo
+	@echo "Done building debugging-enabled libraries ($(LIBRARIES) $(libs_g_OTHER_TARGETS))"
+	@echo
+
+# All optimized libraries
+libs:   $(LIBRARIES_TARGETS) $(libs_OTHER_TARGETS)
+	@echo
+	@echo "Done building optimized libraries ($(LIBRARIES) $(libs_OTHER_TARGETS))"
+	@echo
+else
+libs_g:
+	@echo
+	@echo "No libraries to build"
+	@echo
+libs:
+	@echo
+	@echo "No libraries to build"
+	@echo
+endif
+
+
+ifneq ($(strip $(SHARED_LIBRARIES) $(shlibs_g_OTHER_TARGETS) $(shlibs_OTHER_TARGETS)),)
+# All debugging-enabled shared libraries
+shlibs_g: $(SHLIBRARIES_TARGETS_g) $(shlibs_g_OTHER_TARGETS)
+	@echo
+	@echo "Done building debugging-enabled shared libraries ($(SHARED_LIBRARIES) $(shlibs_g_OTHER_TARGETS))"
+	@echo
+
+# All optimized libraries
+shlibs: $(SHLIBRARIES_TARGETS) $(shlibs_OTHER_TARGETS)
+	@echo
+	@echo "Done building optimized shared libraries ($(SHARED_LIBRARIES) $(shlibs_OTHER_TARGETS))"
+	@echo
+else
+shlibs_g:
+	@echo
+	@echo "No shared libraries to build"
+	@echo
+shlibs:
+	@echo
+	@echo "No shared libraries to build"
+	@echo
+endif
+
+
+opt_64:
+	$(MAKE) opt USE_FULL_64BIT=yes
+	@echo
+
+debug_64:
+	$(MAKE) debug USE_FULL_64BIT=yes
+	@echo
+
+clean_64:
+	$(MAKE) clean USE_FULL_64BIT=yes
+	@echo
+
+# Create directory for applications
+define MAKEAPPDIR
+-$(ECHO)[ -d $(BIN) ] || mkdir -p $(BIN)
+endef
+
+# Create directory for libraries
+define MAKELIBDIR
+-$(ECHO)[ -d $(LIBDIR) ] || mkdir -p $(LIBDIR)
+endef
+
+# Create directory for object files
+define MAKEOBJDIR
+-$(ECHO)[ -d $(OBJ) ] || mkdir -p $(OBJ)
+endef
+
+# Create directory for dependency files
+define MAKEDEPENDDIR
+-$(ECHO)[ -d $(DEPEND_DIR) ] || mkdir -p $(DEPEND_DIR)
+endef
+
+# Create directory for include files
+define MAKEINCLUDEDIR
+-$(ECHO)[ -d $(INCLUDE_DIR) ] || mkdir -p $(INCLUDE_DIR)
+endef
+
+
+
+#################################################################
+#								#
+#			  SECTION III				#
+#								#
+#		   Minor targets of makefile			#
+#								#
+#################################################################
+
+# Phony targets are symbolic names, not files to be built
+.PHONY: clean cleandeps cleanobjs cleanallobjs cleanverstamps cleanall
+.PHONY: verstamps release non_cvs_release non_cvs_root 
+.PHONY: cad_projects cad_links release_links release_linux release_platforms
+.PHONY: check_versions nobuild_release other_makefiles
+.PHONY: install install_bins install_scripts install_man 
+.PHONY: install_ugli install_doc
+.PHONY: postcheckout cad_dist release_cad
+.PHONY: tags libtags makedebug strip makestripdir
+.PHONY: show_libraries show_shared_libraries show_applications show_tests
+.PHONY: can_compile can_install can_strip
+.PHONY: no_deps
+
+# For certain phony targets, don't bother including the dependency files
+# These are the relevant targets
+NOINCLUDE_TARGETS := clean cleandeps cleanobjs cleanallobjs \
+	cleanverstamps cleanall verstamps \
+	postcheckout release non_cvs_release non_cvs_root \
+	cad_projects cad_links release_links release_linux release_platforms \
+	check_versions nobuild_release other_makefiles makedebug \
+	show_libraries show_shared_libraries show_applications show_tests \
+	can_compile can_install can_strip strip $(clean_OTHER_TARGETS) \
+	opt_64 debug_64 clean_64 \
+	$(noinclude_OTHER_TARGETS)
+
+
+#
+# Release platforms
+#
+
+# If the user hasn't defined RELEASE_PLATFORMS, we will
+ifeq ($(strip $(RELEASE_PLATFORMS)),)
+
+ifneq ($(strip $(RELEASE_LINUX)),)
+RELEASE_PLATFORMS += linux
+endif
+
+ifneq ($(strip $(RELEASE_64BIT)),)
+RELEASE_PLATFORMS += solaris64
+
+ifneq ($(strip $(RELEASE_LINUX)),)
+RELEASE_PLATFORMS += linux64
+endif
+
+endif
+
+endif # RELEASE_PLATFORMS
+
+RELEASE_BINS := $(addprefix bin, \
+			$(subst linux,L, \
+			$(subst solaris,S, \
+			$(subst 64,_64, \
+				$(RELEASE_PLATFORMS)))))
+
+RELEASE_OBJS := $(subst bin,obj,$(RELEASE_BINS))
+
+
+
+##########
+# Part A: clean and its relatives
+##########
+
+# cleandeps - delete compilation dependency files
+cleandeps:
+	-rm -rf $(DEPEND_DIR)
+	@echo
+	@echo "Done: make cleandeps."
+
+# cleanobjs - delete object files
+cleanobjs:
+	@echo "Removing object files:"
+	-rm -f $(OBJ)/*.o
+	@echo
+	@echo "Done: make cleanobjs."
+
+# cleanallobjs - delete object files for all release platforms
+cleanallobjs:
+	@echo "Removing object files:"
+	-rm -f $(foreach arg,$(RELEASE_OBJS),$(arg)/*.o)
+	@echo
+	@echo "Done: make cleanallobjs."
+
+# clean - delete all files normally created by make (except dependency files)
+clean: cleanverstamps cleanobjs $(clean_OTHER_TARGETS)
+	-rm -f $(APPLICATIONS_TARGETS) $(APPLICATIONS_TARGETS_g)
+	-rm -f $(TESTS_TARGETS) $(TESTS_TARGETS_g)
+	-rm -f $(LIBDIR)/*.a $(LIBDIR)/*.lib $(LIBDIR)/*.so
+	-rm -f $(INCLUDE_DIR)/*.ytab.h
+	-rm -f $(INCLUDE_DIR)/*_ytab.h
+	-rm -f $(addprefix $(C_DIR)/,$(YACCLEX_CFILES))
+	-rm -f $(CLEAN_FILES)
+	@echo
+	@echo "Done: make clean."
+
+# cleanall - delete all files created by make including dependency files
+cleanall: cleandeps clean
+	@echo
+	@echo "Done: make cleanall."
+
+
+# no_deps - Don't update dependency files if they are out of date
+#
+# If no_deps is the only target, build user_build (default build option).
+#
+ifeq ($(filter-out no_deps,$(MAKECMDGOALS)),)
+no_deps: user_build
+else
+no_deps:
+endif
+	@echo
+	@echo "Dependency files *not* updated - old versions used"
+
+
+##########
+# Part B: verstamps: Regenerate version stamp files
+##########
+
+# List of all version stamp files
+
+# UNDOCUMENTED FEATURE (for compatibility with old makefiles):
+# Turn off generation of version stamp files by setting the variable
+# NO_VERSION_CFILES
+#
+ifndef NO_VERSION_CFILES
+VERSION_FILE_ROOT := $(PLATFORM_CODE).version
+VERSION_CFILES := $(foreach arg,$(APPLICATIONS) $(TESTS), \
+			$(arg)_app.$(VERSION_FILE_ROOT).c) \
+		$(foreach arg,$(sort $(LIBRARIES) $(SHARED_LIBRARIES)), \
+			$(arg)_lib.$(VERSION_FILE_ROOT).c)
+else
+VERSION_CFILES := 
+endif
+
+VERSION_OFILES := $(VERSION_CFILES:.c=$(OBJ_EXT))
+VERSION_OFILES_g := $(VERSION_OFILES:$(OBJ_EXT)=$(OBJ_EXT_g))
+
+verstamps: cleanverstamps $(addprefix $(C_DIR)/,$(VERSION_CFILES))
+	@echo "Done: make verstamps."
+
+# cleanverstamps - delete all version stamp files
+cleanverstamps:
+	@echo "Removing previous version stamp files:"
+	-rm -f $(addprefix $(C_DIR)/,$(VERSION_CFILES))
+	-rm -f $(addprefix $(OBJ)/,$(VERSION_OFILES) $(VERSION_OFILES_g))
+	@echo
+	@echo "Done: make cleanverstamps."
+
+
+##########
+# Part C: release, release_linux, non_cvs_release, non_cvs_root, 
+#            nobuild_release:
+#         List release files
+##########
+
+RELEASE_FILES := \
+	$(addprefix $(C_DIR)/,$(CFILES) $(CCFILES) $(LFILES) $(YFILES)) \
+	$(addprefix bin/,$(SCRIPTS)) \
+	$(addprefix $(INCLUDE_DIR)/,$(HFILES)) \
+	$(addprefix $(DOC_DIR)/,$(DOC_FILES)) \
+	$(addprefix $(MAN_DIR)/,$(MAN_PAGES)) \
+	$(addprefix $(UGLI_DIR)/,$(UGLI_FILES)) \
+	$(addprefix $(TEST_DIR)/,$(TEST_FILES)) \
+	$(MAKEFILES) $(MAKE_FILES) $(MISC_FILES) $(MISC_BUILD_FILES)
+
+release:
+	@echo $(RELEASE_FILES)
+
+release_linux:
+	@echo $(RELEASE_LINUX)
+
+release_platforms:
+	@echo $(RELEASE_PLATFORMS)
+
+non_cvs_root:
+	@echo $(NON_CVS_ROOT)
+
+non_cvs_release:
+	@echo $(NON_CVS_RELEASE)
+
+
+# Files which are to be released but do not affect project compilation
+NOBUILD_RELEASE := $(addprefix bin/,$(SCRIPTS)) \
+	$(addprefix $(DOC_DIR)/,$(DOC_FILES)) \
+	$(addprefix $(MAN_DIR)/,$(MAN_PAGES)) \
+	$(addprefix $(UGLI_DIR)/,$(UGLI_FILES)) \
+	$(addprefix $(TEST_DIR)/,$(TEST_FILES)) \
+	$(MISC_FILES)
+
+nobuild_release:
+	@echo $(NOBUILD_RELEASE)
+
+other_makefiles:
+	@echo $(OTHER_MAKEFILES)
+
+
+##########
+# Part D: cad_projects, cad_links, release_links, check_versions:
+#         List link library versions
+##########
+
+cad_projects:
+# Need to make sure CAD_PROJECTS is defined in the makefile, not environment
+ifeq "$(origin CAD_PROJECTS)" "file"
+	@echo $(strip $(CAD_PROJECTS))
+else
+	@echo CAD_PROJECTS must be defined in GNUmakefile, not in environment!
+	exit 1
+endif
+
+cad_links:
+# Need to make sure CAD_PROJECTS is defined in the makefile, not environment
+ifneq "$(origin CAD_PROJECTS)" "file"
+	@echo CAD_PROJECTS must be defined in GNUmakefile, not in environment!
+	exit 1
+else
+# Need to make sure local projects are not in use
+ifneq ($(strip $(LOCAL_PROJECTS)),)
+	@echo LOCAL_PROJECTS may not be used on stable or bugfix release!
+	exit 1
+else
+	@echo $(strip $(CAD_PROJECT_LINKS))
+endif
+endif
+
+release_links:
+# Need to make sure CAD_PROJECTS is defined in the makefile, not environment
+ifneq "$(origin CAD_PROJECTS)" "file"
+	@echo CAD_PROJECTS must be defined in GNUmakefile, not in environment!
+	exit 1
+else
+# Need to make sure local projects are not in use
+ifneq ($(strip $(LOCAL_PROJECTS)),)
+	@echo LOCAL_PROJECTS may not be used on stable or bugfix release!
+	exit 1
+else
+	@echo $(strip $(CAD_RELEASE_LINKS))
+endif
+endif
+
+# Check whether the list of link libraries is valid
+check_versions:
+# Need to make sure CAD_PROJECTS is defined in the makefile, not environment
+ifeq "$(origin CAD_PROJECTS)" "file"
+	cad_versions $(PROJECT_NAME)-$(PROJECT_VER) check $(CAD_RELEASE_LINKS) < /dev/null
+else
+	@echo CAD_PROJECTS must be defined in GNUmakefile, not in environment!
+	exit 1
+endif
+
+
+##########
+# Part E: show_libraries, show_shared_libraries, 
+#         show_applications, show_tests: List main targets
+##########
+
+show_libraries:
+	@echo $(LIBRARIES) $(libs_g_OTHER_TARGETS) $(libs_OTHER_TARGETS)
+
+show_shared_libraries:
+	@echo $(SHARED_LIBRARIES) $(shlibs_g_OTHER_TARGETS) \
+		$(shlibs_OTHER_TARGETS)
+
+show_applications:
+	@echo $(APPLICATIONS) $(apps_g_OTHER_TARGETS) $(apps_OTHER_TARGETS)
+
+show_tests:
+	@echo $(TESTS) $(tests_g_OTHER_TARGETS) $(tests_OTHER_TARGETS)
+
+
+
+##########
+# Part F: install: Install files in system directories
+##########
+
+# Installs applications in $(HOME)/$(BIN), scripts in $(HOME)/bin,
+# man pages in $(HOME)/man/man1, ugli files in $(HOME)/ugli,
+# doc directory in soft link to $(HOME)/doc/$(PROJECT_NAME)
+
+# DIR_PREFIX is the relative directory name which contains the directories with
+# files to be installed, starting with the "projects" section.
+# By default, this will be /projects/$(PROJECT_NAME)/.release
+DIR_PREFIX := /projects/$(PROJECT_NAME)/.release
+
+# By default, install all applications
+ifndef INSTALL_APPLICATIONS
+INSTALL_APPLICATIONS := $(APPLICATIONS)
+endif
+
+# If user requests, install no applications!
+ifeq ($(strip $(INSTALL_APPLICATIONS)),NONE)
+INSTALL_APPLICATIONS :=
+endif
+
+install: install_bins install_scripts install_man \
+	install_ugli install_doc $(install_OTHER_TARGETS)
+	@echo
+	@echo Done installing all files
+
+
+CAD_SCRIPT_DIR := /usr/cad/bin
+INSTALL_FILES := $(CAD_SCRIPT_DIR)/install_files
+INSTALL_CAD_APP_WRAPPERS := $(CAD_SCRIPT_DIR)/install_cad_app_wrappers
+
+INSTALL_CMDS := $(foreach arg,$(RELEASE_BINS),$(INSTALL_FILES) /proj/caddev/$(arg) ..$(DIR_PREFIX)/$(arg) $(INSTALL_APPLICATIONS); )
+
+install_bins: 
+ifneq ($(strip $(INSTALL_APPLICATIONS)),)
+	-$(INSTALL_CMDS)
+	-$(INSTALL_CAD_APP_WRAPPERS) $(INSTALL_APPLICATIONS)
+endif
+
+install_scripts:
+ifneq ($(strip $(SCRIPTS)),)
+	-$(INSTALL_FILES) $(HOME)/bin ..$(DIR_PREFIX)/bin $(SCRIPTS)
+endif
+
+install_man:
+ifneq ($(strip $(MAN_PAGES)),)
+	-$(INSTALL_FILES) $(HOME)/man/man1 ../..$(DIR_PREFIX)/man $(MAN_PAGES)
+endif
+
+install_ugli:
+ifneq ($(strip $(UGLI_FILES)),)
+	-$(INSTALL_FILES) $(HOME)/ugli ..$(DIR_PREFIX)/ugli $(UGLI_FILES)
+endif
+
+# Directory for doc-files soft link
+INSTALL_DOC_DIR := $(HOME)/doc/$(PROJECT_NAME)
+
+install_doc:
+ifneq ($(strip $(DOC_FILES)),)
+	-chmod 444 $(addprefix $(DOC_DIR)/,$(DOC_FILES))
+	$(ECHO)( \
+	if ((test -h $(INSTALL_DOC_DIR)) || (test -d $(INSTALL_DOC_DIR)))\
+		then rm -f $(INSTALL_DOC_DIR); \
+	fi; \
+	if ((test -f $(INSTALL_DOC_DIR)) || (test -d $(INSTALL_DOC_DIR))) \
+		then echo "failed to install $(INSTALL_DOC_DIR)."; \
+		else ln -s  ..$(DIR_PREFIX)/doc $(INSTALL_DOC_DIR); \
+	fi; \
+	)
+endif
+
+
+INSTALL_BINS    := $(foreach arg,$(RELEASE_BINS), \
+			$(addprefix $(arg)/,$(INSTALL_APPLICATIONS)))
+INSTALL_SCRIPTS := $(addprefix bin/,$(SCRIPTS) $(INSTALL_APPLICATIONS))
+INSTALL_MANS    := $(addprefix man/man1/,$(MAN_PAGES))
+INSTALL_UGLIS   := $(addprefix ugli/,$(UGLI_FILES))
+
+# Empty if no DOC_FILES defined
+INSTALL_DOC     := $(foreach dummy,$(firstword $(DOC_FILES)),doc/$(PROJECT_NAME))
+
+INSTALLABLE_FILES   := $(INSTALL_BINS) $(INSTALL_SCRIPTS) $(INSTALL_MANS) \
+	$(INSTALL_UGLIS) $(INSTALL_DOC)
+
+VERSION_SOFTLINK_FILES := projects/$(PROJECT_NAME)/.release 
+
+
+# Target to execute user-defined actions after project files are checked
+# out or updated from CVS.
+postcheckout: $(POSTCHECKOUT_TARGETS)
+
+
+# Target to distribute project version to external CAD servers.
+# Uses cad_dist script
+cad_dist:
+	cad_dist $(PROJECT_NAME)-$(PROJECT_VER)
+ifneq ($(strip $(INSTALLABLE_FILES)),)
+	cad_dist -pub -f $(INSTALLABLE_FILES)
+endif
+
+
+# Target to distribute project version to external CAD servers.
+# Uses release_cad script
+release_cad:
+	release_cad $(PROJECT_NAME) $(PROJECT_VER)
+	release_cad -fpub $(VERSION_SOFTLINK_FILES) $(INSTALLABLE_FILES)
+
+
+##########
+# Part G: strip: Create stripped binaries from executables
+##########
+
+# All stripped binary filenames (debugging and optimized)
+# Create stripped target filenames for each existing binary file
+STRIPPED_TARGETS = $(foreach arg,$(APPLICATIONS), \
+	$(shell test -x $(BIN)/$(arg)$(OPT_EXT) && echo $(STRIP_BIN)/$(arg)$(OPT_EXT)))
+
+$(STRIP_BIN)/%$(OBJ_EXT): $(BIN)/%$(OBJ_EXT)
+	cp $< $(STRIP_BIN)
+
+$(STRIP_BIN)/%: $(BIN)/%
+	-$(ECHO)rm -f $@
+	cp $< $(STRIP_BIN)
+	-strip $@
+
+strip:	makestripdir $(STRIPPED_TARGETS) $(strip_OTHER_TARGETS)
+
+# Create directory for stripped binaries
+makestripdir: 
+	-$(ECHO)[ -d $(STRIP_BIN) ] || mkdir -p $(STRIP_BIN)
+	@echo
+	@echo "Done stripping executables"
+
+
+##########
+# Part H: tags, libtags: Generate etags/ctags files directory
+##########
+
+TEMP_FILE := /tmp/make_tmp$$$$
+TAG_FILES := $(addprefix $(C_DIR)/,$(sort $(CFILES) $(CCFILES) $(YFILES) $(LFILES))) \
+	$(addprefix $(INCLUDE_DIR)/, $(HFILES))
+TAG_CLIB_FILES := $(addsuffix /lib/tags,$(CAD_PROJECT_DIRS))
+
+
+# Comment out the lines from '(' to ')' if you don't need other
+# libraries or defines in your tags file.
+tags: $(TAG_FILES) $(tags_OTHER_TARGETS)
+ifneq ($(strip $(TAG_FILES)),)
+	-rm -f $(C_DIR)/tags
+	ctags -tw -f $(C_DIR)/tags $(TAG_FILES)
+	etags -o $(C_DIR)/TAGS $(TAG_FILES)
+	( \
+	awk >> $(C_DIR)/tags \
+'/^.define/ {if (index($$2,"(") == 0) {print $$2"  "FILENAME"  /^"$$0"/"}}' $(INCLUDE_DIR)/*.h; \
+	cat $(C_DIR)/tags $(TAG_CLIB_FILES) |sort -u > $(TEMP_FILE) ; \
+	mv $(TEMP_FILE) $(C_DIR)/tags ; \
+	)
+	@echo
+	@echo Done generating tags files
+else
+	@echo tags not generated since no relevant source files exist
+endif
+
+libtags:
+ifneq ($(strip $(LIBRARIES) $(SHARED_LIBRARIES)),)
+	-rm -f lib/tags
+	ctags -tw -f lib/tags $(TAG_FILES)
+	etags -o lib/TAGS $(TAG_FILES)
+	@echo Done generating libtags files
+else
+	@echo libtags files not generated since no libraries built
+endif
+
+
+##########
+# Part I: can_compile, can_install, can_strip: Query build properties (0/1)
+##########
+
+# Does this project have files which can/should be compiled?
+# NOTE: Do I need to add any ???_OTHER_TARGETS to this???
+can_compile:
+ifneq ($(strip $(LIBRARIES) $(SHARED_LIBRARIES) $(APPLICATIONS) $(TESTS) \
+	$(all_OTHER_TARGETS) $(opt_OTHER_TARGETS) $(debug_OTHER_TARGETS) \
+	$(apps_g_OTHER_TARGETS) $(apps_OTHER_TARGETS) \
+	$(libs_g_OTHER_TARGETS) $(libs_OTHER_TARGETS) \
+	$(shlibs_g_OTHER_TARGETS) $(shlibs_OTHER_TARGETS) \
+	$(tests_g_OTHER_TARGETS) $(tests_OTHER_TARGETS)),)
+	@echo 1
+else
+	@echo 0
+endif
+
+# Does this project have files which can/should be installed?
+can_install:
+ifneq ($(strip $(STRIPPED_TARGETS) $(SCRIPTS) $(MAN_PAGES) \
+	$(UGLI_FILES) $(DOC_FILES) $(install_OTHER_TARGETS)),)
+	@echo 1
+else
+	@echo 0
+endif
+
+# Does this project have executables which can/should be stripped?
+can_strip:
+ifneq ($(strip $(APPLICATIONS) $(strip_OTHER_TARGETS)),)
+	@echo 1
+else
+	@echo 0
+endif
+
+
+##########
+# Part J: makedebug: Print some variable values for debugging the makefile
+##########
+
+# For debugging, set arg to the list of projects.
+# Other variables may need arg to be set.
+arg := $(CAD_PROJECTS)
+
+# Macro: Makes hidden backslashes in the variable name visible
+DEBUG_ECHO = $(subst ;,\;,$(subst &,\&,$(subst \,\\,$($(DEBUGVAR)))))
+
+makedebug:
+	@echo Variable value: $(DEBUGVAR) = $(DEBUG_ECHO)
+
+
+#################################################################
+#								#
+#			  SECTION IV				#
+#								#
+#		    Compilation dependencies			#
+#								#
+#################################################################
+
+##########
+# Part A:  C/C++ compiler flags for compilation
+##########
+
+# Name of actual user-specified compilers
+BASE_CC := $(CC)
+BASE_CXX := $(CXX)
+
+# But if Parasoft's Insure++ is to be invoked, compiler names must
+# be redefined!
+ifdef INSURE
+PARASOFT := /usr/local/parasoft/insure++/6.1-new
+# LD_LIBRARY_PATH := $(LD_LIBRARY_PATH) $(PARASOFT)/lib.solaris/insure
+CC := $(PARASOFT)/bin.solaris/insure -Zoi "compiler $(BASE_CC)"
+CXX := $(PARASOFT)/bin.solaris/insure -Zoi "compiler $(BASE_CXX)"
+endif
+
+CFLAGS    := $(ALL_FLAGS) $(GCC_FLAGS) $(EXTRA_CFLAGS)
+CXXFLAGS   := $(ALL_FLAGS) $(GCC_FLAGS) $(EXTRA_CXXFLAGS)
+
+
+##########
+# Part B: Pattern rules for compiling source files
+##########
+
+# Clear standard suffix list - we're not planning to use suffix rules,
+# just pattern rules.
+.SUFFIXES:
+
+# Cancel built-in implicit rules for extracting RCS/SCCS files
+%: %,v
+%: RCS/%,v
+%: RCS/%
+%: s.%
+%: SCCS/s.%
+
+
+# B1. Macros to generate make dependency file from C/C++ source file
+
+# Based on method by Tom Tromey <tromey@cygnus.com> used by FSF's
+# automake tool. Description available: Advanced Auto-Dependency Generation,
+# <http://www.paulandlesley.org/gmake/autodep.html>
+
+# We'll use a dependency file for each object file (file.P for file.o)
+# which will contain the makefile header dependencies for that file.
+# They'll all be included later on. They'll be automatically regenerated
+# when the .o file is rebuilt.
+#
+# The original dependency file (file.d) is created as a side product by
+# the GNU compiler using the -MD option when compiling the .o file.
+# This file is then transformed so that both the debugging (_g.o) and the
+# optimized (.o) object files are dependent on the same list of files.
+#
+# For more details, see the website above.
+
+# For use when including $(OBJ) in sed command (replaces / with \/)
+OBJ_ESCAPED := $(subst /,\/,$(OBJ))
+
+# For use when including $(*D) (subdirectory of source file) in sed command
+SRCDIR_ESCAPED = $(subst /,\/,$(*D)/)
+
+# Base name of dependency file to create
+DEPFILE = $(DEPEND_DIR)/$*
+
+define TRANSFORM_DEPENDFILE
+sed -e 's/\($(*F)\)\$(OBJ_EXT)[ :]*/$(OBJ_ESCAPED)\/$(SRCDIR_ESCAPED)\1$(OBJ_EXT_g) $(OBJ_ESCAPED)\/$(SRCDIR_ESCAPED)\1$(OBJ_EXT): /g' -e 's/\/\.\//\//g' < $(DEPFILE).d > $(DEPFILE).P; \
+sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
+	-e '/^$$/ d' -e 's/$$/ :/' < $(DEPFILE).d >> $(DEPFILE).P; \
+rm -f $(DEPFILE).d
+endef
+
+
+# B2. Pattern rules for compiling C/C++
+
+# "Wrapper" programs (such as purify) can be used on both compilation
+# and linking (but not for dependency calculations!).
+# The program command will be prefixed to the compilation/link command.
+#
+# The compilation wrapper command is called COMPILEWRAP;
+# the linker wrapper command is called LINKWRAP;
+# the linker wrapper command for shared library creation is called SHLIBWRAP.
+#
+# If PURIFY is defined, its value will be used for LINKWRAP.
+ifneq ($(strip $(PURIFY)),)
+LINKWRAP := $(PURIFY)
+endif
+
+
+# Support debugging options for a selective list of object files
+DEBUG_OFILES_PATH := $(addprefix $(OBJ)/, $(DEBUG_OFILES))
+$(DEBUG_OFILES_PATH): OPT_FLAG := $(OPT_FLAG_g)
+
+
+
+GCC_DEPENDOPT = -Wp,-MD,$(DEPFILE).d
+OUT_FLAG := -o 
+OUT_FLAG_LINK := -o 
+ifdef WINE
+   OUT_FLAG := -Fo
+   OUT_FLAG_LINK := -Fe
+GCC_DEPENDOPT := 
+endif
+
+$(OBJ)/%$(OBJ_EXT_g): %.c $(DEPEND_DIR)/c_compile_g
+	-echo nissan: compiling COMPILE.c == $(COMPILE.c)
+	-echo GCC_FLAGS == $(GCC_FLAGS)
+	-echo CFLAGS == $(CFLAGS)
+	-echo ALL_FLAGS == $(ALL_FLAGS)
+	-echo INCLUDE_FLAGS == $(INCLUDE_FLAGS)
+	-echo TEST_INCLUDE_FLAGS == $(TEST_INCLUDE_FLAGS)
+	-echo INCLUDE_DIR == $(INCLUDE_DIR)
+#	-echo
+#	-echo
+#	-echo
+	$(MAKEOBJDIR)
+	 $(COMPILEWRAP) $(COMPILE.c) $(GCC_DEPENDOPT) $(OPT_FLAG_g) $(OUT_FLAG)$@ $<
+	$(ECHO)$(TRANSFORM_DEPENDFILE)
+	@echo
+
+$(OBJ)/%$(OBJ_EXT_g): %.cc $(DEPEND_DIR)/cxx_compile_g
+#	-echo nissan: compiling COMPILE.c == $(COMPILE.c)
+#	-echo GCC_FLAGS == $(GCC_FLAGS)
+#	-echo CFLAGS == $(CFLAGS)
+#	-echo ALL_FLAGS == $(ALL_FLAGS)
+#	-echo INCLUDE_FLAGS == $(INCLUDE_FLAGS)
+#	-echo TEST_INCLUDE_FLAGS == $(TEST_INCLUDE_FLAGS)
+#	-echo INCLUDE_DIR == $(INCLUDE_DIR)
+#	-echo PARALLEL_WRAP == 
+#	-echo PARALLEL_CMD == $(PARALLEL_CMD)
+#	-echo
+	$(MAKEOBJDIR)
+	 $(COMPILEWRAP) $(COMPILE.cc) $(GCC_DEPENDOPT) $(OPT_FLAG_g) $(OUT_FLAG)$@ $<
+	$(ECHO)$(TRANSFORM_DEPENDFILE)
+	@echo
+
+$(OBJ)/%$(OBJ_EXT): %.c $(DEPEND_DIR)/c_compile
+	$(MAKEOBJDIR)
+	 $(COMPILEWRAP) $(COMPILE.c) $(GCC_DEPENDOPT) $(OPT_FLAG) $(OUT_FLAG)$@ $<
+	$(ECHO)$(TRANSFORM_DEPENDFILE)
+	@echo
+
+$(OBJ)/%$(OBJ_EXT): %.cc $(DEPEND_DIR)/cxx_compile
+	$(MAKEOBJDIR)
+	 $(COMPILEWRAP) $(COMPILE.cc) $(GCC_DEPENDOPT) $(OPT_FLAG) $(OUT_FLAG)$@ $<
+	$(ECHO)$(TRANSFORM_DEPENDFILE)
+	@echo
+
+
+# Remember the flags used last time make was invoked, so files are rebuilt
+# when flags change
+
+# When makefiles change, need to update flag files and submakefiles
+MAKEFILE_DEPENDS := $(ALLMAKEFILES)
+
+# Generate a (hopefully) unique ID number by starting a Perl job and
+# printing its process id.
+TMPFILE_ID := $(shell perl -e 'print $$$$')
+TMPFILE_SUFFIX := .new.$(TMPFILE_ID)
+
+$(DEPEND_DIR)/c_compile_g: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(COMPILEWRAP) $(COMPILE.c) $(OPT_FLAG_g) $(GCC_DEPENDOPT) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+
+$(DEPEND_DIR)/c_compile: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(COMPILEWRAP) $(COMPILE.c) $(OPT_FLAG) $(GCC_DEPENDOPT) $(DEBUG_OFILES) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+
+$(DEPEND_DIR)/cxx_compile_g: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(COMPILEWRAP) $(COMPILE.cc) $(OPT_FLAG_g) $(GCC_DEPENDOPT) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+
+$(DEPEND_DIR)/cxx_compile: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(COMPILEWRAP) $(COMPILE.cc) $(OPT_FLAG) $(GCC_DEPENDOPT) $(DEBUG_OFILES) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+
+
+# B3. Pattern rules to compile lex/yacc combinations - one lex and one yacc file
+
+
+# LEX_YACC_HANDLER=new to use the new style of Makefile for yacc/lex files
+ifeq ($(strip $(LEX_YACC_HANDLER)),new)
+
+# First, the new style:
+
+# Filenames must share the same root, such as c/MyParser.y and c/MyParser.l
+# Intermediate C-files will be named c/MyParser.y.c and c/MyParser.l.c
+# Internal symbols containing "yy" or "YY" will be replaced with MyParser_yy / MyParser_YY
+# Parse table will be written into include/MyParser.ytab.h
+
+# Build c/MyParser.y.c and include/MyParser.ytab.h from c/MyParser.y
+$(C_DIR)/%.y.cc $(INCLUDE_DIR)/%.ytab.h: $(C_DIR)/%.y $(DEPEND_DIR)/yflags
+	@echo nissan yacc target
+	@echo Compiling $(YACC) grammar file $(C_DIR)/$*.y
+	$(MAKEINCLUDEDIR)
+	$(YACC.y) -b $* $(C_DIR)/$*.y
+	sed -e "s/yy/$*_yy/g" -e "s/YY/$*_YY/g" $*.tab.c > $(C_DIR)/$*.y.cc
+	/bin/rm $*.tab.c
+	sed -e "s/yy/$*_yy/g" -e "s/YY/$*_YY/g" $*.tab.h > $(INCLUDE_DIR)/$*.ytab.h
+	/bin/rm $*.tab.h
+	@echo
+
+# Build c/MyParser.l.c from c/MyParser.l
+$(C_DIR)/%.l.cc: $(C_DIR)/%.l $(DEPEND_DIR)/lflags
+	@echo nissan lex target
+	@echo Compiling $(LEX) lexical scanner file $(C_DIR)/$*.l
+	$(LEX) -t $(LFLAGS) $(C_DIR)/$*.l | \
+		sed -e "s/yy/$*_yy/g" -e "s/YY/$*_YY/g" > $@
+	@echo
+
+# The intermediate .c files generated by lex/yacc
+YACC_CFILES := $(addsuffix .cc,$(YFILES))
+LEX_CFILES :=  $(addsuffix .cc,$(LFILES))
+
+endif
+
+
+
+
+
+# For all lex/yacc styles: all intermediate .c files generated by lex/yacc
+YACCLEX_CFILES := $(LEX_CFILES) $(YACC_CFILES)
+
+# And the corresponding .o files
+YACC_OFILES := $(YACC_CFILES:.cc=$(OBJ_EXT))
+LEX_OFILES :=  $(LEX_CFILES:.cc=$(OBJ_EXT))
+YACCLEX_OFILES := $(LEX_OFILES) $(YACC_OFILES)
+
+# So make won't automatically delete the intermediate .c files
+.SECONDARY: $(addprefix $(C_DIR)/,$(YACCLEX_CFILES))
+
+
+# Remember the flags used last time make was invoked, so files are rebuilt
+# when flags change
+$(DEPEND_DIR)/yflags: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(YACC.y) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+
+$(DEPEND_DIR)/lflags: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(LEX) $(LFLAGS) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+
+
+# B4. Pattern rules to create application/library version stamp files
+
+# List of all source files which must compiled for applications and
+# libraries to be built. Avoid duplication of Yacc/Lex c-files.
+ALL_SOURCES := 	$(YACCLEX_CFILES) \
+	$(filter-out $(YACCLEX_CFILES),$(CFILES) $(CCFILES))
+
+
+# Creates C files which define strings containing the version stamp info
+
+# Define some variables for version stamp generation
+$(C_DIR)/%_app.$(VERSION_FILE_ROOT).c: TYPE := application
+$(C_DIR)/%_lib.$(VERSION_FILE_ROOT).c: TYPE := library
+$(C_DIR)/%_app.$(VERSION_FILE_ROOT).c: TARGET = $(patsubst %_app,%,$*)
+$(C_DIR)/%_lib.$(VERSION_FILE_ROOT).c: TARGET = $(patsubst %_lib,%,$*)
+
+# Pattern rule to build application/library version stamp file
+# For an application app1 on Linux-64, the name will be app1_app.L_64.version.c
+# For a library lib1, the name will be lib1_lib.L_64,version.c
+$(C_DIR)/%.$(VERSION_FILE_ROOT).c: $(DEPEND_DIR)/versioninfo
+	$(ECHO)cat < /dev/null > $@
+	$(ECHO)echo "/* Version stamp file created automatically by MSIL CAD makefile */" >> $@
+	$(ECHO)echo "const char *$(TARGET)_what_string = \"@(#)$(TYPE) $(TARGET): project $(PROJECT_NAME)-$(PROJECT_VER) (\" __DATE__ \" \" __TIME__ \"), uses $(CAD_PROJECT_LINKS)\";" >> $@
+	$(ECHO)echo "const char *$(TARGET)_project_name = \"$(PROJECT_NAME)\";" >> $@
+	$(ECHO)echo "const char *$(TARGET)_project_version = \"$(PROJECT_VER)\";" >> $@
+	$(ECHO)echo "const char *$(TARGET)_compile_date = __DATE__;" >> $@
+	$(ECHO)echo "const char *$(TARGET)_compile_time = __TIME__;" >> $@
+	$(ECHO)echo "const char *$(TARGET)_cad_link_libraries = \"$(CAD_PROJECT_LINKS)\";" >> $@
+ifneq ($(strip $(USE_FULL_64BIT)),)
+	$(ECHO)echo "const char *$(TARGET)_compile_platform = \"$(shell uname -sr) 64-bit\";" >> $@
+else
+	$(ECHO)echo "const char *$(TARGET)_compile_platform = \"$(shell uname -sr) 32-bit\";" >> $@
+endif
+	@echo Done generating $(TYPE) version stamp file $@
+
+# So make won't automatically delete the *version.c files
+.SECONDARY: $(addprefix $(C_DIR)/,$(VERSION_CFILES))
+
+# Remember the version info from last time make was invoked, so files are 
+# rebuilt when versions change
+$(DEPEND_DIR)/versioninfo: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(PROJECT_NAME) $(PROJECT_VER) $(CAD_PROJECT_LINKS) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+
+##########
+# Part C: Automatic generation of executable dependency files
+##########
+
+# This section is rather complex. Here's the general idea:
+#
+# Each application, test or library to be built is made up of a set of object
+# files. Each target file should therefore be dependent on the corresponding
+# list of object files. Unfortunately, GNU make does not allow variables in
+# the dependency list of a rule to change based on which target is being built.
+#
+# To get around this restriction, we use included makefiles. For each target,
+# the rules to build it, including its own list of object files, are written
+# into separate include files, which themselves are included later on in this
+# makefile. If these include files are absent, GNU make will build them from
+# the rules below.
+#
+# These include files are named ???_appdepend.mk, ???_libdepend.mk or
+# ???_shlibdepend.mk, where ??? is the name of the target and the rest of the
+# name reflects the type of target.
+
+
+# The implementation of this section includes multiple layers of make macros,
+# making it difficult to follow. Read carefully!
+
+
+# C1. Basic macros
+#
+# Some relatively simple macros for use in the following section
+# The argument $* will be set by a pattern rule for compilation.
+# It contains the name of the target to be built.
+
+# For an application/library named app, take the object files from variables 
+# $(app_OFILES) and $(COMMON_OFILES), and add the object file directory to each.
+# Also add any external object files as appropriate
+PROJ_OWN_OFILES = $(addprefix $(OBJ)/,$($*_OFILES) $(COMMON_OFILES))
+PROJ_EXTERN_OFILES = $(COMMON_EXTERN_OFILES) $($*_EXTERN_OFILES)
+
+PROJ_OFILES  = $(PROJ_OWN_OFILES) $(PROJ_EXTERN_OFILES)
+
+# Object files lists for debugging versions
+ifndef EXTERN_OFILES_NOOPT
+PROJ_OFILES_g = $(patsubst %$(OBJ_EXT),%$(OBJ_EXT_g), \
+		$(patsubst %$(LIB_EXT),%$(LIB_EXT_g),$(PROJ_OFILES)))
+else
+PROJ_OFILES_g = $(patsubst %$(OBJ_EXT),%$(OBJ_EXT_g), \
+		$(patsubst %$(LIB_EXT),%$(LIB_EXT_g),$(PROJ_OWN_OFILES))) \
+	$(PROJ_EXTERN_OFILES)
+endif
+
+# UNDOCUMENTED FEATURE (for compatibility with old makefiles):
+# Turn off generation of version stamp files by setting the variable
+# NO_VERSION_CFILES
+ifndef NO_VERSION_CFILES
+#
+# First list the version stamp object file.
+#
+APP_OFILES_g = $(OBJ)/$*_app.$(VERSION_FILE_ROOT)$(OBJ_EXT_g) $(PROJ_OFILES_g)
+APP_OFILES   = $(OBJ)/$*_app.$(VERSION_FILE_ROOT)$(OBJ_EXT) $(PROJ_OFILES)
+LIB_OFILES_g = $(OBJ)/$*_lib.$(VERSION_FILE_ROOT)$(OBJ_EXT_g) $(PROJ_OFILES_g)
+LIB_OFILES   = $(OBJ)/$*_lib.$(VERSION_FILE_ROOT)$(OBJ_EXT) $(PROJ_OFILES)
+else
+APP_OFILES_g = $(PROJ_OFILES_g)
+APP_OFILES   = $(PROJ_OFILES)
+LIB_OFILES_g = $(PROJ_OFILES_g)
+LIB_OFILES   = $(PROJ_OFILES)
+endif
+
+
+# C2. Make commands to generate the included dependency makefiles
+
+# Lists of different types of dependency makefiles
+APPS_DEPEND   := $(addprefix $(DEPEND_DIR)/,$(foreach arg,$(APPLICATIONS), \
+			$(arg)_appdepend.mk))
+TESTS_DEPEND  := $(addprefix $(DEPEND_DIR)/,$(foreach arg,$(TESTS), \
+			$(arg)_appdepend.mk))
+LIBS_DEPEND   := $(addprefix $(DEPEND_DIR)/,$(foreach arg,$(LIBRARIES), \
+			$(arg)_libdepend.mk))
+SHLIBS_DEPEND := $(addprefix $(DEPEND_DIR)/,$(foreach arg,$(SHARED_LIBRARIES), \
+			$(arg)_shlibdepend.mk))
+
+
+# Include files for application and test targets
+#
+# The result will look something like:
+#
+# binS/myapp_g: objS/myapp_app.version_g.o objS/app1_g.o objS/app2_g.o objS/common_g.o /proj/caddev/projects/proj/proj-1.0/libS/libproj_g.a c/_makedepend/applink
+#	$(MAKEAPPDIR)
+#	 $(LINKWRAP) $(filter-out -I%,$(LINK.cc)) -o $@ objS/myapp_app.version_g.o objS/app1_g.o objS/app2_g.o objS/common_g.o -lproj_g
+#	@echo Done building application $@.
+#	@echo
+#
+# binS/myapp: objS/myapp_app.version.o objS/app1.o objS/app2.o objS/common.o /proj/caddev/projects/proj/proj-1.0/libS/libproj.a c/_makedepend/applink
+#	$(MAKEAPPDIR)
+#	 $(LINKWRAP) $(filter-out -I%,$(LINK.cc)) -o $@ objS/myapp_app.version.o objS/app1.o objS/app2.o objS/common.o -lproj
+#	@echo Done building application $@.
+#	@echo
+
+# Generate include files for all application targets
+appsdepends: $(APPS_DEPEND)
+	@echo Done generating makefile dependencies for applications
+
+
+TMP_LINKFILE = $(addprefix /tmp/,$(subst /,_,$@$(TMPFILE_SUFFIX)))
+
+LINKINTMP := $(CAD_DIR)/cadenv/.release/bin/linkintmp
+
+ifneq ($(strip $(APPLICATIONS) $(TESTS)),)
+$(APPLICATIONS_TARGETS_g) $(APPLICATIONS_TARGETS): TYPE := application
+$(TESTS_TARGETS_g) $(TESTS_TARGETS): TYPE := test
+
+# Don't rebuild dependency files if no_deps target selected
+ifeq ($(filter no_deps,$(MAKECMDGOALS)),)
+
+# Generate include files for individual application targets
+$(DEPEND_DIR)/%_appdepend.mk: $(DEPEND_DIR)/swap_exts $(MAKEFILE_DEPENDS)
+	@echo Generating dependency file $(@F) for $(TYPE) $*
+	$(ECHO)cat < /dev/null > $@
+ifneq ($(strip $(SWAP_EXTS)),)
+	@echo "$(BIN)/$*: $(APP_OFILES_g) $(LIBRARY_FILENAMES_g) $(DEPEND_DIR)/applink" >> $@
+else
+	@echo "$(BIN)/$*_g: $(APP_OFILES_g) $(LIBRARY_FILENAMES_g) $(DEPEND_DIR)/applink" >> $@
+endif
+	@echo "	\$$(MAKEAPPDIR)" >> $@
+ifneq ($(strip $(LINK_LOCALLY)),)
+	@echo "	\$$(PARALLEL_WRAP) $(LINKINTMP) \$$@ \$$(LINKWRAP) $(filter-out -I%,\$$(LINK.cc)) $($*_EXTRA_LDFLAGS) $(APP_OFILES_g) $(CLIBS_g) $($*_EXTRA_LIBFLAGS)" >> $@
+else
+	@echo "	\$$(PARALLEL_WRAP) \$$(LINKWRAP) $(filter-out -I%,\$$(LINK.cc)) $($*_EXTRA_LDFLAGS) $(OUT_FLAG_LINK)\$$@ $(APP_OFILES_g) $(CLIBS_g) $($*_EXTRA_LIBFLAGS)" >> $@
+endif
+	@echo "	@echo Done building \$$(TYPE) \$$@." >> $@
+	@echo "	@echo" >> $@
+	@echo "" >> $@
+ifneq ($(strip $(SWAP_EXTS)),)
+	@echo "$(BIN)/$*_g: $(APP_OFILES) $(LIBRARY_FILENAMES) $(DEPEND_DIR)/applink" >> $@
+else
+	@echo "$(BIN)/$*: $(APP_OFILES) $(LIBRARY_FILENAMES) $(DEPEND_DIR)/applink" >> $@
+endif
+	@echo "	\$$(MAKEAPPDIR)" >> $@
+ifneq ($(strip $(LINK_LOCALLY)),)
+	@echo "	\$$(PARALLEL_WRAP) $(LINKINTMP) \$$@ \$$(LINKWRAP) $(filter-out -I%,\$$(LINK.cc)) $($*_EXTRA_LDFLAGS) $(APP_OFILES) $(CLIBS) $($*_EXTRA_LIBFLAGS)" >> $@
+else
+	@echo "	\$$(PARALLEL_WRAP) \$$(LINKWRAP) \$$(filter-out -I%,\$$(LINK.cc)) $($*_EXTRA_LDFLAGS) $(OUT_FLAG_LINK)\$$@ $(APP_OFILES) $(CLIBS) $($*_EXTRA_LIBFLAGS)" >> $@
+endif
+	@echo "	@echo Done building \$$(TYPE) \$$@." >> $@
+	@echo "	@echo" >> $@
+endif  # no_deps
+
+$(DEPEND_DIR)/swap_exts: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(SWAP_EXTS) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+
+$(DEPEND_DIR)/applink: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(LINKWRAP) $(filter-out -I%,$(LINK.cc)) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+endif
+
+# Generate include files for all test targets
+testsdepends: $(TESTS_DEPEND)
+	@echo Done generating makefile dependencies for tests
+
+
+
+# Include files for non-shared library targets
+#
+# The resulting include file will look something like this:
+#
+# libS/libmylib_g.a: objS/mylib_lib.version_g.o objS/lib1_g.o objS/lib2_g.o objS/common_g.o
+#	$(MAKELIBDIR)
+#	 ar rcv $@ $?
+#	 ranlib $@
+#	 ar t $@
+#	@echo Done building library $@.
+#	@echo
+#
+# libS/libmylib.a: objS/mylib_lib.version.o objS/lib1.o objS/lib2.o objS/common.o
+#	$(MAKELIBDIR)
+#	 ar rcv $@ $?
+#	 ranlib $@
+#	 ar t $@
+#	@echo Done building library $@.
+#	@echo
+#
+
+# Generate include files for all non-shared library targets
+libsdepends: $(LIBS_DEPEND)
+	@echo Done generating makefile dependencies for libraries
+
+ifneq ($(strip $(LIBRARIES)),)
+PAT_LIB_FILE_g = $(foreach arg,$*,$(LIB_FILE_g))
+PAT_LIB_FILE   = $(foreach arg,$*,$(LIB_FILE))
+
+# Don't rebuild dependency files if no_deps target selected
+ifeq ($(filter no_deps,$(MAKECMDGOALS)),)
+
+# Generate include file for individual non-shared library targets
+$(DEPEND_DIR)/%_libdepend.mk: $(MAKEFILE_DEPENDS)
+	@echo Generating dependency file $(@F) for library $*
+	$(MAKEDEPENDDIR)
+	$(ECHO)cat < /dev/null > $@
+	@echo "$(PAT_LIB_FILE_g): $(LIB_OFILES_g)" >> $@
+	@echo "	\$$(MAKELIBDIR)" >> $@
+ifneq ($(filter release_build,$(MAKECMDGOALS)),)
+	@echo "	-rm" \$$@ >> $@
+	@echo "	ar rcv" \$$@ \$$\^ >> $@
+else
+	@echo "	ar rcv" \$$@ \$$? >> $@
+endif
+	@echo "	ranlib" \$$@ >> $@
+	@echo "	ar t" \$$@ >> $@
+	@echo "	@echo Done building library \$$@." >> $@
+	@echo "	@echo" >> $@
+	@echo "" >> $@
+	@echo "$(PAT_LIB_FILE): $(LIB_OFILES)" >> $@
+	@echo "	\$$(MAKELIBDIR)" >> $@
+ifneq ($(filter release_build,$(MAKECMDGOALS)),)
+	@echo "	-rm" \$$@ >> $@
+	@echo "	ar rcv" \$$@ \$$\^ >> $@
+else
+	@echo "	ar rcv" \$$@ \$$? >> $@
+endif
+	@echo "	ranlib" \$$@ >> $@
+	@echo "	ar t" \$$@ >> $@
+	@echo "	@echo Done building library \$$@." >> $@
+	@echo "	@echo" >> $@
+endif
+endif # no_deps
+
+# Generate include file for all shared library targets
+#
+# As above, but with different commands (specified by user variables)
+#
+# The resulting include file will look something like this:
+#
+# libS/libmylib_g.so: objS/mylib_lib.version_g.o objS/lib1_g.o objS/lib2_g.o objS/common_g.o
+#	$(MAKELIBDIR)
+#	$(SHLIBWRAP) $(SHLIB_LD) -G  -o $@ $?
+#	@echo Done building shared library $@.
+#	@echo
+#
+# libS/libmylib.so: objS/mylib_lib.version.o objS/lib1.o objS/lib2.o objS/common.o
+#	$(MAKELIBDIR)
+#	$(SHLIBWRAP) $(SHLIB_LD -G  -o $@ $?
+#	@echo Done building shared library $@.
+#	@echo
+#
+
+# Generate include files for all shared library targets
+shlibsdepends: $(SHLIBS_DEPEND)
+	@echo Done generating makefile dependencies for shared libraries
+
+ifneq ($(strip $(SHARED_LIBRARIES)),)
+
+PAT_SHLIB_FILE_g = $(foreach arg,$*,$(SHLIB_FILE_g))
+PAT_SHLIB_FILE   = $(foreach arg,$*,$(SHLIB_FILE))
+
+# Don't rebuild dependency files if no_deps target selected
+ifeq ($(filter no_deps,$(MAKECMDGOALS)),)
+
+# Generate include file for individual shared library targets
+$(DEPEND_DIR)/%_shlibdepend.mk: $(MAKEFILE_DEPENDS)
+	@echo Generating dependency file $(@F) for shared library $*
+	$(MAKEDEPENDDIR)
+	$(ECHO)cat < /dev/null > $@
+	@echo "$(PAT_SHLIB_FILE_g): $(LIB_OFILES_g) $(LIBRARY_FILENAMES_g)" >> $@
+	@echo "	\$$(MAKELIBDIR)" >> $@
+ifneq ($(strip $(LINK_LOCALLY)),)
+	@echo "	\$$(PARALLEL_WRAP) $(LINKINTMP) \$$@ \$$(SHLIBWRAP) \$$(SHLIB_LD) $(LDFLAGS) $(SHLIB_LDFLAGS) $($*_EXTRA_LDFLAGS) $(LIB_OFILES_g) $(CLIBS_g) $(SHLIB_LIBFLAGS) $($*_EXTRA_LIBFLAGS)" >> $@
+else
+	@echo "	\$$(PARALLEL_WRAP) \$$(SHLIBWRAP) \$$(SHLIB_LD) $(LDFLAGS) $(SHLIB_LDFLAGS) $($*_EXTRA_LDFLAGS) -o \$$@ $(LIB_OFILES_g) $(CLIBS_g) $(SHLIB_LIBFLAGS) $($*_EXTRA_LIBFLAGS)" >> $@
+endif
+	@echo "	@echo Done building shared library \$$@." >> $@
+	@echo "	@echo" >> $@
+	@echo "" >> $@
+	@echo "$(PAT_SHLIB_FILE): $(LIB_OFILES) $(LIBRARY_FILENAMES)" >> $@
+	@echo "	\$$(MAKELIBDIR)" >> $@
+ifneq ($(strip $(LINK_LOCALLY)),)
+	@echo "	\$$(PARALLEL_WRAP) $(LINKINTMP) \$$@ \$$(SHLIBWRAP) \$$(SHLIB_LD) $(LDFLAGS) $(SHLIB_LDFLAGS) $($*_EXTRA_LDFLAGS) $(LIB_OFILES) $(CLIBS) $(SHLIB_LIBFLAGS) $($*_EXTRA_LIBFLAGS)" >> $@
+else
+	@echo "	\$$(PARALLEL_WRAP) \$$(SHLIBWRAP) \$$(SHLIB_LD) $(LDFLAGS) $(SHLIB_LDFLAGS) $($*_EXTRA_LDFLAGS) -o \$$@ $(LIB_OFILES) $(CLIBS) $(SHLIB_LIBFLAGS) $($*_EXTRA_LIBFLAGS)" >> $@ 
+endif
+	@echo "	@echo Done building shared library \$$@." >> $@
+	@echo "	@echo" >> $@
+	@echo "" >> $@
+	@echo "$(PAT_SHLIB_FILE_g) $(PAT_SHLIB_FILE): $(DEPEND_DIR)/shliblink" >> $@
+	@echo "" >> $@
+endif # no_deps
+
+# Remember the flags used last time make was invoked, so files are rebuilt
+# when flags change
+$(DEPEND_DIR)/shliblink: $(MAKEFILE_DEPENDS)
+#	@echo Generating $@
+	$(MAKEDEPENDDIR)
+	@echo $(SHLIBWRAP) $(SHLIB_LD) > $@$(TMPFILE_SUFFIX)
+	$(ECHO)diff $@ $@$(TMPFILE_SUFFIX) > /dev/null 2>&1 || cp $@$(TMPFILE_SUFFIX) $@
+	$(ECHO)rm $@$(TMPFILE_SUFFIX)
+#	@echo Done generating $@
+endif
+
+
+# C3. Include the include files
+
+# The dependency include files for each object file
+
+# All the object files built by this project's targets
+# External object files not included
+ALL_TARGET_OFILES := $(sort \
+	$(foreach arg, \
+	$(APPLICATIONS) $(sort $(LIBRARIES) $(SHARED_LIBRARIES)) $(TESTS), \
+	$($(arg)_OFILES)) $(COMMON_OFILES))
+
+ALL_TARGET_OFILES_g := $(ALL_TARGET_OFILES:$(OBJ_EXT)=$(OBJ_EXT_g))
+
+# First the non-lex/yacc files, then the lex files, then the yacc files
+# This is because when included makefiles are not found, they are
+# regenerated in the reverse order in which they are referenced.
+ALL_DEPENDENCY_OFILES := $(filter-out $(YACCLEX_OFILES),$(ALL_TARGET_OFILES)) \
+	$(LEX_OFILES) $(YACC_OFILES) $(VERSION_OFILES)
+
+# Add directories and suffixes to the above
+SOURCE_DEPENDENCIES := $(addprefix $(DEPEND_DIR)/,$(addsuffix .P,\
+	$(basename $(ALL_DEPENDENCY_OFILES))))
+
+# MY_MAKECMDGOALS is like MAKECMDGOALS, but never empty
+# Assumes default target is 'user_build'
+ifeq ($(strip $(MAKECMDGOALS)),)
+MY_MAKECMDGOALS := user_build
+else
+MY_MAKECMDGOALS := $(MAKECMDGOALS)
+endif
+
+
+# If make has been invoked with a target not in NOINCLUDE_TARGETS, 
+# include dependency files
+ifneq ($(strip $(SOURCE_DEPENDENCIES)),)
+ifneq ($(strip $(filter-out $(NOINCLUDE_TARGETS),$(MY_MAKECMDGOALS))),)
+-include $(SOURCE_DEPENDENCIES)
+-include $(APPS_DEPEND) $(LIBS_DEPEND) $(SHLIBS_DEPEND) $(TESTS_DEPEND)
+endif
+endif

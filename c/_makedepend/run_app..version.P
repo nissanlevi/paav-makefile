@@ -1,0 +1,2 @@
+obj_412/run_app..version_g.o obj_412/run_app..version.o: c/run_app..version.c /usr/include/stdc-predef.h
+c/run_app..version.c /usr/include/stdc-predef.h :
